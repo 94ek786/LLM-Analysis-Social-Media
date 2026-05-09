@@ -1,0 +1,147 @@
+# -*- coding: utf-8 -*-
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.svm import SVC # 導入支援向量機分類器
+from sklearn.metrics import confusion_matrix, accuracy_score, classification_report
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --- 1. 數據加載與初步處理 ---
+# 讀取數據
+df_stock = pd.read_csv("2330TW.csv", encoding="utf-8-sig", parse_dates=["Date"], index_col="Date")
+df_index = pd.read_csv("TWSE_21.01to23.12.csv", encoding="utf-8-sig", parse_dates=["日期"], index_col="日期")
+df_analysis = pd.read_csv("analysis_ternaryB.csv", encoding="utf-8-sig", parse_dates=["date"], index_col="date")
+df_C = pd.read_csv("analysis_ternaryC.csv", encoding="utf-8-sig", parse_dates=["date"], index_col="date")
+# 按日期合併數據
+df_index.index.name = "Date"
+df = pd.merge(df_stock, df_index, on="Date", how="left", suffixes=("", ""))
+df.index.name = "date"
+df = pd.merge(df, df_analysis, on="date", how="left", suffixes=("", ""))
+df["analysis"].fillna(0, inplace=True)
+df = pd.merge(df, df_C, on="date", how="left", suffixes=("", "_C"))
+df["analysis_C"].fillna(0, inplace=True)
+df.fillna(method='ffill', inplace=True)
+
+# 計算每日收盤價變動率
+df['Price_Change'] = df['Close'].pct_change()
+
+# 檢查並處理缺失值 (pct_change 會產生 NaN)
+print("--- 數據缺失值檢查 ---")
+print(df.isnull().sum())
+df.dropna(inplace=True) # 刪除包含 Price_Change NaN 的第一行
+
+# --- 2. 特徵選擇與目標變數定義 ---
+#, 'MA_10', 'W%R_12', 'BIAS_6', 'AD', 'CCI_10', 'Volume', 'Open_diff', 'High_diff', 'Low_diff','Price_Change', "收盤指數"
+features = [
+    'RSI_12', 'K', 'D','MACD', 'MA_5', "analysis", "analysis_C"
+    
+]
+target = 'UpDown' # 不再直接使用原始 UpDown
+
+missing_cols = [col for col in features if col not in df.columns]
+if missing_cols:
+    print(f"錯誤：CSV 檔案中缺少以下特徵欄位: {', '.join(missing_cols)}")
+    exit()
+if 'Close' not in df.columns:
+     print(f"錯誤：CSV 檔案中缺少 'Close' 欄位，無法計算未來漲跌。")
+     exit()
+
+# 準備特徵 X (使用當前時間點 t 的特徵)
+X_data = df[features].copy()
+
+# * 修正：計算真實的 5 天後漲跌作為目標 y *
+# 1. 獲取 5 天後的收盤價
+df['Close_Future_5d'] = df['Close'].shift(-5)
+
+# 2. 創建新的目標欄位 'Target_5d'
+#    如果 5 天後收盤價 > 今天收盤價，則為 1 (漲)，否則為 0 (跌或平)
+df['Target_5d'] = (df['Close_Future_5d'] > df['Close']).astype(int)
+
+# 3. 準備 y_data (使用新計算的 Target_5d)
+#    同時需要刪除因為 shift(-5) 而在末尾產生的 NaN
+y_data = df['Target_5d'].copy()
+#y_data = df[target]
+
+# 4. 合併 X 和 y，並刪除 NaN (主要來自 y_data 末尾的 NaN)
+combined = pd.concat([X_data, y_data], axis=1)
+combined.dropna(inplace=True)
+
+X_data = combined[features]
+y_data = combined[target] # 使用新的目標欄位'Target_5d'
+
+print(f"--- 特徵與目標準備完畢 (預測 5 天後漲跌) ---")
+print(f"X shape: {X_data.shape}")
+print(f"y shape: {y_data.shape}")
+
+# --- 3. 數據標準化 ---
+scaler = MinMaxScaler(feature_range=(0, 1))
+scaled_features = scaler.fit_transform(X_data)
+X_scaled = pd.DataFrame(scaled_features, index=X_data.index, columns=features)
+
+# --- 4. 數據集分割 (訓練、驗證、測試) ---
+train_size = int(len(X_scaled) * 0.8)
+X_train, y_train = X_scaled[:train_size], y_data[:train_size]
+X_test, y_test = X_scaled[train_size:], y_data[train_size:]
+
+print(f"--- 數據集大小 ---")
+print(f"訓練集 X_train: {X_train.shape}")
+print(f"測試集 X_test: {X_test.shape}")
+
+print("--- 類別分佈檢查 ---")
+print(f"訓練集 y_train (5天後漲跌): 0={np.sum(y_train == 0)}, 1={np.sum(y_train == 1)}")
+print(f"測試集 y_test (5天後漲跌):  0={np.sum(y_test == 0)}, 1={np.sum(y_test == 1)}")
+
+# --- 5. 建立並訓練 SVM 模型 ---
+model = SVC(kernel='rbf', C=1.0, gamma='scale', class_weight='balanced', random_state=42, probability=True)
+
+print("--- 開始訓練 SVM 模型 ---")
+model.fit(X_train, y_train)
+print("--- 模型訓練完成 ---")
+
+# --- 6. 模型評估 ---
+y_pred = model.predict(X_test)
+
+accuracy = accuracy_score(y_test, y_pred)
+print(f"--- 模型評估 (測試集) ---")
+print(f"準確率 (Accuracy): {accuracy:.4f}")
+
+cm = confusion_matrix(y_test, y_pred)
+print("--- 混淆矩陣 (Confusion Matrix) ---")
+print("   預測 0   預測 1")
+# 確保 cm 有兩個維度
+if cm.shape == (1, 1):
+    if np.unique(y_test)[0] == 0: cm_display = np.array([[cm[0,0], 0], [0, 0]])
+    else: cm_display = np.array([[0, 0], [0, cm[0,0]]])
+elif cm.shape == (1, 2):
+     if np.unique(y_test)[0] == 0: cm_display = np.array([[cm[0,0], cm[0,1]], [0, 0]])
+     else: cm_display = np.array([[0, 0], [cm[0,0], cm[0,1]]])
+elif cm.shape == (2, 1):
+    if y_pred.size > 0 and int(round(y_pred[0])) == 0 : cm_display = np.array([[cm[0,0], 0], [cm[1,0], 0]])
+    elif y_pred.size > 0: cm_display = np.array([[0, cm[0,0]], [0, cm[1,0]]])
+    else: cm_display = np.array([[0,0],[0,0]])
+else: cm_display = cm
+
+print(f"實際 0: {cm_display[0,0]:^7d} {cm_display[0,1]:^7d}")
+print(f"實際 1: {cm_display[1,0]:^7d} {cm_display[1,1]:^7d}")
+
+print("--- 分類報告 (Classification Report) ---")
+# 加入 zero_division=0 避免在 precision/recall/f1 為 0 時產生警告
+print(classification_report(y_test, y_pred, target_names=['跌/平 (0)', '漲 (1)'], zero_division=0))
+
+# 繪製混淆矩陣熱力圖
+plt.figure(figsize=(6, 4))
+sns.heatmap(cm_display, annot=True, fmt='d', cmap='Blues', xticklabels=['預測 跌/平 (0)', '預測 漲 (1)'], yticklabels=['實際 跌/平 (0)', '實際 漲 (1)'])
+plt.xlabel('預測標籤 (Predicted Label)')
+plt.ylabel('真實標籤 (True Label)')
+plt.title('混淆矩陣 (Confusion Matrix) - SVM (預測 5 天後 - 修正目標)')
+try:
+    plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'Arial Unicode MS']
+    plt.rcParams['axes.unicode_minus'] = False
+except Exception as e:
+    print(f"無法設定中文字體，圖表標籤可能顯示異常: {e}")
+plt.show()
+
+# --- 移除特徵重要性分析 (標準 SVM 不直接提供) ---
+
+print("--- 程式執行完畢 ---")
